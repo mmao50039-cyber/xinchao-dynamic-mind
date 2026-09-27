@@ -24,6 +24,7 @@ import { BRIDGE_SERVER_PROTOCOL, BRIDGE_STREAM_PROTOCOL, BridgeQueue, bridgeDeli
 import { CabinStore } from './cabin-store.js';
 import { boardEnabled, postBoardMessage, readBoardMessages } from './board-client.js';
 import { SYSTEM_VERSION } from './version.js';
+import { backupBeforeUpgrade } from './upgrade-backup.js';
 import { memoryConnectionState } from './connection-diagnostics.js';
 import { PersonalityStore, computePersonalityStats } from './personality-store.js';
 
@@ -42,6 +43,8 @@ if (config.serviceToken.length < 32) {
   throw new Error('SERVICE_TOKEN must be at least 32 characters — generate one: openssl rand -hex 32');
 }
 
+// 旧版（2.x）状态第一次被改写成新格式之前，先原样备份一份，见 upgrade-backup.js
+await backupBeforeUpgrade(config.statePath, log);
 const store = new StateStore(config.statePath, () => newState());
 const model = new ModelClient(config.model);
 const ombre = new OmbreClient(config.ombre);
