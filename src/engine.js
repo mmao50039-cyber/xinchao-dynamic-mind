@@ -1,12 +1,41 @@
 import { createHash } from 'node:crypto';
-import { DIMENSIONS, DRIVE_KEYS, SATURATE_CEIL, SATURATE_FLOOR } from './dimensions.js';
-import { newThoughtPool, tickThoughtPool, addFlashThought, obsessionBonus } from './thought-pool.js';
+import { DIMENSIONS, DRIVE_KEYS, DOMAIN_AFFINITY, SATURATE_CEIL } from './dimensions.js';
+import { newThoughtPool, tickThoughtPool, addFlashThought, obsessionBonus, reinforceThought, SURFACED_DECAY, DREAM_DECAY } from './thought-pool.js';
+import { DRIVE_KEYS as ALL_DRIVE_KEYS } from './dimensions.js';
+import { ensureAwareness } from './awareness.js';
+import { ensureSelfSignals } from './self-signals.js';
+import { INTERACTION_EMOTION, applyEmotionImpulse, blendEmotionTowardTone, emotionGrowthFactor, ensureEmotion, newEmotion, settleEmotion } from './emotion.js';
 
 const clamp = (value, min = 0, max = 1) => Math.max(min, Math.min(max, value));
+// 驱力被顶到自己的静息天花板之上后，每小时松弛回来的比例（越大回落越快）。
+const CEIL_RELAX_PER_HOUR = 0.10;
+const THOUGHT_FEEDBACK_CAP = 0.85;   // 3.3.6：念头回推的驱力上限
+const RELIEF_MAX = 0.60;             // 3.3.7：一次互动最多松掉六成（以前 0.35，拉不动天花板）
+const RELIEF_PLATEAU_FROM = 0.15;
+const RELIEF_PLATEAU_MAX_HOURS = 2.5;
+const RELIEF_FLOOR_RATIO = 0.35;              // 3.3.8：松弛砍不穿 静息线×0.35
+const RELIEF_REPEAT_WINDOW_MS = 60 * 60_000;  // 3.3.8：一小时内同类互动效果减半
+const TRAIL_SAMPLE_MS = 30 * 60_000;  // 3.3.7：驱力轨迹每 30 分钟记一点，留 24 小时，给"落/涨"措辞和以后的驱力账本用
+const TRAIL_KEEP = 48;
+const TREND_LOOKBACK_MS = 2 * 3_600_000;
+// 记忆共振只回推亲和度够强的维度，弱关联不动（沿用规格 onRecall 的 >0.5 门槛）。
+const RESONANCE_MIN_AFFINITY = 0.5;
+// 作息预期：她隔了一段时间后再出现才算"一次到来"计入节律；心跳不算。旧节律每次到来轻微衰减，自适应。
+const ARRIVAL_GAP_MINUTES = 90;
+const ARRIVAL_DECAY = 0.99;
 const iso = (value) => new Date(value).toISOString();
 const SESSION_TONES = new Set(['neutral', 'calm', 'warm', 'guarded', 'conflicted', 'focused', 'playful', 'tired']);
 const SESSION_FIELDS = ['warmth', 'tension', 'attention', 'confidence'];
 const MAX_RECENT_CONVERSATION_EVENTS = 256;
+const DEFAULT_SATISFACTION_PLATEAU_HOURS = 2;
+
+// 只用现有 12 维的小型耦合表。它改的是“接下来自然长多快”，
+// 不是每次 tick 直接往数值上叠加，因此不会因结算频率变高而自激。
+const DRIVE_GROWTH_COUPLINGS = Object.freeze({
+  possess: [{ source: 'anger', slope: -0.65 }],
+  crave: [{ source: 'grieve', slope: 0.50 }],
+  monitor: [{ source: 'grieve', slope: 0.45 }],
+});
 
 export const INTERACTION_TYPES = Object.freeze([
   'companionship',
@@ -21,10 +50,12 @@ export const INTERACTION_TYPES = Object.freeze([
   'reconciliation',
 ]);
 
+// 3.3.7 去饱和：关系类互动真的能把想她/惦记/馋拉下来（以前一次亲密只松 12%，一个多小时就又爬回天花板，"涌"永远在）。
+// 松多少 = 乘 (1-relief)；relief ≥ 0.15 的那一维顺带进一段饱足平台（不长），让它落下去之后先待一会儿再慢慢涨回来。
 const INTERACTION_EFFECTS = Object.freeze({
-  companionship: { relief: { monitor: 0.06, social: 0.05 } },
-  affection: { relief: { possess: 0.08, crave: 0.08, monitor: 0.05 } },
-  intimacy: { relief: { possess: 0.12, crave: 0.15, libido: 0.18 } },
+  companionship: { relief: { monitor: 0.18, possess: 0.06, social: 0.08 } },
+  affection: { relief: { possess: 0.22, crave: 0.18, monitor: 0.15 } },
+  intimacy: { relief: { possess: 0.40, crave: 0.45, libido: 0.55, monitor: 0.15 } },
   sharing: { relief: { share: 0.14, social: 0.04 } },
   discovery: { relief: { curiosity: 0.15, boredom: 0.12 } },
   task_progress: { relief: { duty: 0.15 } },
@@ -42,7 +73,20 @@ function ensureStateShape(state) {
     : [];
   state.interactionUsage ??= {};
   state.handoffNotes = Array.isArray(state.handoffNotes) ? state.handoffNotes : [];
-  state.schemaVersion = Math.max(7, Number(state.schemaVersion) || 0);
+  delete state.pending;   // 3.3：攒下的话退役，黑匣子接替（升级时未说完的已迁进匣子）
+  state.satisfactionPlateaus = state.satisfactionPlateaus && typeof state.satisfactionPlateaus === 'object'
+    ? state.satisfactionPlateaus
+    : {};
+  state.arrivalHistogram = Array.isArray(state.arrivalHistogram) && state.arrivalHistogram.length === 24
+    ? state.arrivalHistogram.map((n) => Number(n) || 0)
+    : Array.from({ length: 24 }, () => 0);
+  state.driveTrail = Array.isArray(state.driveTrail) ? state.driveTrail.slice(-TRAIL_KEEP) : [];
+  state.surfacedBuckets = state.surfacedBuckets && typeof state.surfacedBuckets === 'object' && !Array.isArray(state.surfacedBuckets) ? state.surfacedBuckets : {};   // 3.3.9：桶 → 上次浮现时间
+  state.interactionLastAt = state.interactionLastAt && typeof state.interactionLastAt === 'object' ? state.interactionLastAt : {};
+  ensureEmotion(state);
+  ensureAwareness(state);
+  ensureSelfSignals(state);
+  state.schemaVersion = Math.max(9, Number(state.schemaVersion) || 0);
   return state;
 }
 
@@ -123,18 +167,41 @@ function applyInteractionOutcome(state, type, now, options = {}) {
 
   const effect = INTERACTION_EFFECTS[type];
   const affected = new Set();
+  // 3.3.8（09-19 修 3.3.7 的矫枉过正：一天十几次亲昵把想她砍到 0.1，平台连成片涨不回来）：
+  //  · 同类互动一小时内再来，效果减半（一场聊天里记五次 affection 不该等于五次见面）
+  //  · 松弛只作用于底线以上的部分，底线 = 静息线的 35%（想她约 0.29）——再多亲昵也砍不穿"有她"
+  //  · 平台不叠加：已有平台就不续
+  const lastSame = Date.parse(state.interactionLastAt?.[type] ?? '');
+  const repeatMul = Number.isFinite(lastSame) && now.getTime() - lastSame < RELIEF_REPEAT_WINDOW_MS ? 0.5 : 1;
   for (const [key, relief] of Object.entries(effect.relief ?? {})) {
     if (!DRIVE_KEYS.includes(key)) continue;
     const current = Number(state.drives[key] ?? 0);
-    state.drives[key] = Number(clamp(current * (1 - clamp(Number(relief), 0, 0.35))).toFixed(4));
+    const r = clamp(Number(relief) * repeatMul, 0, RELIEF_MAX);
+    const dim = DIMENSIONS[key];
+    const floor = Number.isFinite(dim?.decayHalfLifeHours) ? 0 : RELIEF_FLOOR_RATIO * Number(dim?.ceil ?? SATURATE_CEIL);
+    const next = current > floor ? floor + (current - floor) * (1 - r) : current;
+    state.drives[key] = Number(clamp(next).toFixed(4));
     affected.add(key);
+    const activeUntil = Date.parse(state.satisfactionPlateaus[key]?.until ?? '');
+    if (r >= RELIEF_PLATEAU_FROM && !(Number.isFinite(activeUntil) && activeUntil > now.getTime())) {
+      const hours = clamp(r * 6, 0, RELIEF_PLATEAU_MAX_HOURS);
+      state.satisfactionPlateaus[key] = { startedAt: iso(now), until: iso(new Date(now.getTime() + hours * 3_600_000)), reason: `relief:${type}` };
+    }
   }
+  state.interactionLastAt = { ...(state.interactionLastAt ?? {}), [type]: iso(now) };
   for (const [key, increase] of Object.entries(effect.increase ?? {})) {
     if (!DRIVE_KEYS.includes(key)) continue;
     const current = Number(state.drives[key] ?? 0);
     state.drives[key] = Number(clamp(current + clamp(Number(increase), 0, 0.12)).toFixed(4));
     affected.add(key);
   }
+  // 3.3.1 记得在气什么：冲突时把她那句留下来（≤60 字，随生气一起退），和好就翻篇。
+  // 以前生气只是个数字，他知道自己在气却不知道为什么。
+  if (type === 'conflict' && options.cause) {
+    const cause = String(options.cause).replace(/\s+/g, ' ').trim().slice(0, 60);
+    if (cause) state.grudge = { cause, at: now.toISOString() };
+  }
+  if (type === 'reconciliation' && state.grudge) delete state.grudge;
   state.interactionUsage[day] = used + 1;
   state.interactionUsage = Object.fromEntries(
     Object.entries(state.interactionUsage).sort(([left], [right]) => right.localeCompare(left)).slice(0, 14),
@@ -185,10 +252,83 @@ function applySessionOverlay(state, event, now) {
   return { sessionId, created };
 }
 
+// 梦醒的后果：心情脉冲（离 0.5 的偏差折半，最多 ±0.2）+ 闪念（挂在做梦时最强的那一维）。
+export function applyDreamWake(state, dream, now = new Date()) {
+  const mood = dream?.mood;
+  if (mood && Number.isFinite(Number(mood.valence)) && Number.isFinite(Number(mood.arousal))) {
+    const dv = clamp((Number(mood.valence) - 0.5) * 0.5, -0.2, 0.2);
+    const da = clamp((Number(mood.arousal) - 0.3) * 0.5, -0.2, 0.2);
+    applyEmotionImpulse(state, { valence: dv, arousal: da }, 'dream', now);
+  }
+  const text = String(dream?.image || dream?.residue || '').trim();
+  const key = ALL_DRIVE_KEYS.includes(dream?.driveKey) ? dream.driveKey : (topDrives(state, 1)[0]?.key ?? null);
+  if (text && key) {
+    state.thoughtPool ??= newThoughtPool();
+    addFlashThought(state.thoughtPool, key, text.slice(0, 80), 0.62, { decay: DREAM_DECAY, ombreBucketId: dream.ombreBucketId ?? null, sourceOmbreBucketIds: dream.sourceOmbreBucketIds ?? [] });
+  }
+  return state;
+}
+
+// 浮现 → 念头池（3.3）：白天捞上来的记忆不再代笔推送，而是在思绪池里落一条闪念。
+// 同一维度反复浮现（在闪念散掉前再被强化）才升成持续念头——"老想起一件事"就是这么来的。
+// 机制与输出回流共用 reinforceThought，收敛靠池子自己。
+export function applySurfacedThought(input, driveKey, text, now = new Date(), amount = 0.45, metadata = {}) {
+  const state = ensureStateShape(structuredClone(input));
+  if (!DRIVE_KEYS.includes(driveKey) || !String(text ?? '').trim()) return { state, changed: false };
+  state.thoughtPool ??= newThoughtPool();
+  const result = reinforceThought(state.thoughtPool, driveKey, String(text).trim().slice(0, 80), amount, { decay: SURFACED_DECAY, ...metadata });
+  state.revision += 1;
+  return { state, changed: true, ...result };
+}
+
+// 浮现的记忆落到哪一维：按 domain 亲和度取最强的一维；没有就用当前最强驱力。
+// 3.3.9：浮现念头挂在哪一维——按亲和度从高到低，跳过已经「涌」的维（高出自己静息线 0.05 或 ≥0.90）。
+// 原来永远挂亲和度最高的那维：「内心」→沉淀 0.8 几乎每段记忆都带，沉淀维静息线最低、回落又慢，
+// 于是一直被念头往上堆、一直是「涌」，驱力提示也一直挑它。都在涌就还挂最高的那维。
+export function surfacedDriveKey(domains = [], state = null) {
+  const merged = {};
+  for (const raw of domains) {
+    const map = DOMAIN_AFFINITY[String(raw ?? '').trim()];
+    if (!map) continue;
+    for (const [key, value] of Object.entries(map)) {
+      if (!DRIVE_KEYS.includes(key)) continue;
+      merged[key] = Math.max(merged[key] ?? 0, Number(value) || 0);
+    }
+  }
+  const ranked = Object.entries(merged).sort((a, b) => b[1] - a[1]).map(([key]) => key);
+  if (!ranked.length) return state ? (topDrives(state, 1)[0]?.key ?? null) : null;
+  if (!state) return ranked[0];
+  const surging = (key) => {
+    const v = Number(state.drives?.[key] ?? 0);
+    const ceil = Number(DIMENSIONS[key]?.ceil ?? SATURATE_CEIL);
+    return v >= 0.90 || v >= ceil + 0.05;
+  };
+  return ranked.find((key) => !surging(key)) ?? ranked[0];
+}
+
+// 3.3.9：同一段记忆 72 小时内不再浮现。OB 不带关键词时按权重返回，同样的情绪坐标每次都捞到同一段，
+// 同一个闪念连着几天冒出来、还被升成「持续念头」——那是检索单调，不是真的放不下。
+export const SURFACE_COOLDOWN_HOURS = 72;
+export function recentSurfacedBucketIds(state, now = new Date(), hours = SURFACE_COOLDOWN_HOURS) {
+  const since = new Date(now).getTime() - hours * 3_600_000;
+  return Object.entries(state?.surfacedBuckets ?? {})
+    .filter(([, at]) => Date.parse(at) >= since)
+    .map(([id]) => id);
+}
+export function recordSurfacedBuckets(input, ids = [], now = new Date(), hours = SURFACE_COOLDOWN_HOURS) {
+  const state = structuredClone(input);
+  const since = new Date(now).getTime() - hours * 3_600_000;
+  const kept = Object.entries(state.surfacedBuckets ?? {}).filter(([, at]) => Date.parse(at) >= since);
+  state.surfacedBuckets = Object.fromEntries(kept);
+  for (const id of ids) if (id) state.surfacedBuckets[String(id)] = iso(now);
+  state.revision = (state.revision ?? 0) + 1;
+  return state;
+}
+
 export function newState(now = new Date()) {
   const at = iso(now);
   return {
-    schemaVersion: 7,
+    schemaVersion: 9,
     revision: 0,
     consciousness: 'awake',
     lastConversationAt: at,
@@ -211,10 +351,17 @@ export function newState(now = new Date()) {
     nextDaytimeEmergenceAt: null,
     daytimeEmergenceUsage: {},
     pendingAwareness: null,
+    satisfactionPlateaus: {},
     sessionOverlays: {},
     contextDeliveries: {},
     recentConversationEvents: [],
     interactionUsage: {},
+    arrivalHistogram: Array.from({ length: 24 }, () => 0),
+    emotion: newEmotion(now),
+    emotionJournal: [],
+    emotionDays: {},
+    awareness: { candidates: [], lastScanDay: null },
+    recentSurfacings: [],
   };
 }
 
@@ -313,6 +460,19 @@ export function settleState(input, now = new Date(), sleepAfterMinutes = 90, opt
   const isNight   = hour >= 22 || hour < 6;
 
   const fatigueMultiplier = 1 - clamp(Number(state.fatigue ?? 0), 0, 0.3);
+  const couplingEnabled = options.couplingEnabled !== false;
+  // 情绪调制（3.3 第四步）：用结算前的情绪快照改增速，和驱力耦合一样只改 rate，不加数值。
+  const emotionModulationEnabled = options.emotionModulationEnabled !== false;
+  const emotionSnapshot = { valence: Number(state.emotion?.valence), arousal: Number(state.emotion?.arousal) };
+  const couplingSnapshot = Object.fromEntries(DRIVE_KEYS.map((key) => [key, Number(state.drives[key] ?? 0)]));
+
+  for (const [key, plateau] of Object.entries(state.satisfactionPlateaus)) {
+    const until = Date.parse(plateau?.until ?? '');
+    if (!DRIVE_KEYS.includes(key) || !Number.isFinite(until) || until <= nowMs) {
+      delete state.satisfactionPlateaus[key];
+      changed = true;
+    }
+  }
 
   for (const key of DRIVE_KEYS) {
     const dim = DIMENSIONS[key];
@@ -324,20 +484,45 @@ export function settleState(input, now = new Date(), sleepAfterMinutes = 90, opt
       continue;
     }
 
+    // 情绪型驱力（grieve/anger）：没有增长项，只按半衰期往 0 回落；事件把它抬起来，时间把它放下去。
+    if (Number.isFinite(dim.decayHalfLifeHours) && dim.decayHalfLifeHours > 0) {
+      const next = Number(clamp(current * Math.pow(0.5, elapsedHours / dim.decayHalfLifeHours)).toFixed(4));
+      if (next !== current) changed = true;
+      state.drives[key] = next;
+      if (key === 'anger' && next < 0.03 && state.grudge) { delete state.grudge; changed = true; }   // 气消了就忘了在气什么
+      continue;
+    }
+    // 时间地板 = 每个驱力向自己的静息天花板生长；被事件/共振/回流顶到之上就慢慢松弛回来。
+    // 不再让十二维一起爬到同一个 0.80——那样 topDrives 没了区分度，驱力偏置召回也失了信号。
+    const baseCeil = Number.isFinite(dim.ceil) ? dim.ceil : SATURATE_CEIL;
+    const bias = clamp(Number(options.driveBias?.[key] ?? 1), 0.9, 1.1);
+    const ceil = clamp(baseCeil * bias);
     let next;
-    if (current >= SATURATE_CEIL) {
-      const decay = (current - SATURATE_FLOOR) * 0.10 * elapsedHours;
-      next = clamp(Math.max(SATURATE_FLOOR, current - decay));
+    if (current > ceil) {
+      const decay = (current - ceil) * CEIL_RELAX_PER_HOUR * elapsedHours;
+      next = clamp(Math.max(ceil, current - decay));
     } else {
       let rate = dim.growPerHour;
       if (isNight && dim.nightMul !== undefined) rate *= dim.nightMul;
       rate *= fatigueMultiplier;
-      next = Math.min(clamp(current + rate * elapsedHours), SATURATE_CEIL);
+      if (couplingEnabled) {
+        for (const coupling of DRIVE_GROWTH_COUPLINGS[key] ?? []) {
+          const sourceValue = clamp(Number(couplingSnapshot[coupling.source] ?? 0));
+          rate *= Math.max(0, 1 + coupling.slope * sourceValue);
+        }
+      }
+      if (emotionModulationEnabled) rate *= emotionGrowthFactor(key, emotionSnapshot);
+      const plateauUntil = Date.parse(state.satisfactionPlateaus[key]?.until ?? '');
+      if (Number.isFinite(plateauUntil) && plateauUntil > nowMs) rate = 0;
+      next = Math.min(clamp(current + rate * elapsedHours), ceil);
     }
 
     if (next !== current) changed = true;
     state.drives[key] = Number(next.toFixed(4));
   }
+
+  // 情绪层：只做指数回落（睡着回落更快），回落目标被 grieve/anger 拽着。没有增长项，不自激。
+  if (settleEmotion(state, elapsedHours, { sleeping: state.consciousness === 'sleeping', drives: state.drives, now, timeZone }).changed) changed = true;
 
   // Tick thought pool
   state.thoughtPool ??= newThoughtPool();
@@ -345,10 +530,13 @@ export function settleState(input, now = new Date(), sleepAfterMinutes = 90, opt
   for (const [key, amount] of Object.entries(feedbacks)) {
     if (DRIVE_KEYS.includes(key)) {
       const before = Number(state.drives[key]);
-      state.drives[key] = Number(clamp(before + amount).toFixed(4));
+      // 3.3.6：念头回推只把驱力顶到 THOUGHT_FEEDBACK_CAP 为止，已经够高就不推——念头本身已经够强，不需要再顶到天花板
+      if (before >= THOUGHT_FEEDBACK_CAP) continue;
+      state.drives[key] = Number(clamp(Math.min(THOUGHT_FEEDBACK_CAP, before + amount)).toFixed(4));
       if (state.drives[key] !== before) changed = true;
     }
   }
+
 
   // Fatigue: slowly recovers during sleep, slowly builds during prolonged high-drive wakefulness
   if (state.consciousness === 'sleeping') {
@@ -368,9 +556,34 @@ export function settleState(input, now = new Date(), sleepAfterMinutes = 90, opt
     changed = true;
   }
 
+  // 3.3.7：驱力轨迹采样（30 分钟一点，24 小时）
+  const lastSample = Date.parse(state.driveTrail[state.driveTrail.length - 1]?.at ?? '');
+  if (!Number.isFinite(lastSample) || nowMs - lastSample >= TRAIL_SAMPLE_MS) {
+    state.driveTrail = [...state.driveTrail, { at: iso(now), drives: Object.fromEntries(DRIVE_KEYS.map((k) => [k, Number(state.drives[k] ?? 0)])) }].slice(-TRAIL_KEEP);
+    changed = true;
+  }
+
   state.lastSettledAt = iso(now);
   if (changed) state.revision += 1;
   return { state, changed, elapsedHours, idleMinutes };
+}
+
+/** 3.3.7：某一维两小时前到现在变了多少（没有足够旧的样本就用最老的一点；一点都没有就 null）。 */
+export function driveTrend(state, key, now = new Date()) {
+  const trail = Array.isArray(state?.driveTrail) ? state.driveTrail : [];
+  if (!trail.length) return null;
+  const cutoff = now.getTime() - TREND_LOOKBACK_MS;
+  let ref = null;
+  for (const sample of trail) {
+    const t = Date.parse(sample?.at ?? '');
+    if (!Number.isFinite(t)) continue;
+    if (t <= cutoff) ref = sample; else break;
+  }
+  ref ??= trail[0];
+  const before = Number(ref?.drives?.[key]);
+  const current = Number(state?.drives?.[key]);
+  if (!Number.isFinite(before) || !Number.isFinite(current)) return null;
+  return Number((current - before).toFixed(4));
 }
 
 // ── Conversation event (wake up / interact) ───────────────────────
@@ -417,6 +630,11 @@ export function applyConversationEvent(input, event = {}, now = new Date(), opti
       residue: belongsToThisSleep ? latest.residue : null,
       note: '外部记忆 MCP 只是记忆材料来源；调用记忆服务本身不代表醒来。',
     };
+    // 梦有后果（3.3）：醒来时按梦留下的心情打一次情绪脉冲，把梦里最强的意象塞进思绪池当闪念。
+    if (belongsToThisSleep && !latest.wakeApplied) {
+      applyDreamWake(state, latest, now);
+      latest.wakeApplied = true;
+    }
   }
 
   const interaction = type && !eventId
@@ -426,7 +644,12 @@ export function applyConversationEvent(input, event = {}, now = new Date(), opti
       reasonCode: 'missing_event_id',
       affectedDrives: [],
     }
-    : applyInteractionOutcome(state, type, now, options);
+    : applyInteractionOutcome(state, type, now, { ...options, cause: event.cause });
+
+  // 情绪层：互动事件打一次脉冲（和驱力效果同一道日限门），会话 tone 把情绪往落点拉一小段。
+  if (interaction.applied && INTERACTION_EMOTION[type]) applyEmotionImpulse(state, INTERACTION_EMOTION[type], type, now);
+  const overlayTone = state.sessionOverlays?.[session.sessionId]?.tone;
+  if (overlayTone && overlayTone !== 'neutral') blendEmotionTowardTone(state, overlayTone, now);
 
   // Additive deltas (backward-compatible)
   for (const [key, delta] of Object.entries(event.driveDeltas ?? {})) {
@@ -440,6 +663,18 @@ export function applyConversationEvent(input, event = {}, now = new Date(), opti
     if (!DRIVE_KEYS.includes(key)) continue;
     const dim = DIMENSIONS[key];
     state.drives[key] = Number(clamp(Number(state.drives[key]) * (dim.satisfyMul ?? 0.40)).toFixed(4));
+    const plateauHours = clamp(
+      Number(dim.satietyHours ?? options.satisfactionPlateauHours ?? DEFAULT_SATISFACTION_PLATEAU_HOURS),
+      0,
+      24,
+    );
+    if (plateauHours > 0) {
+      state.satisfactionPlateaus[key] = {
+        startedAt: iso(now),
+        until: iso(new Date(now.getTime() + plateauHours * 3_600_000)),
+        reason: 'satisfied',
+      };
+    }
 
     // Cross-inhibition: satisfying key X reduces drives that list X in inhibitedBy
     for (const otherKey of DRIVE_KEYS) {
@@ -454,6 +689,19 @@ export function applyConversationEvent(input, event = {}, now = new Date(), opti
   for (const thought of event.flashThoughts ?? []) {
     if (DRIVE_KEYS.includes(thought.key)) {
       addFlashThought(state.thoughtPool, thought.key, thought.text ?? '', thought.intensity ?? 0.70);
+    }
+  }
+
+  // 作息预期：记下"她这个点来了"。只在真实会话事件（非心跳）且隔了一段时间后计入，
+  // 让直方图学的是"她通常什么时候出现"，不是一次长聊里的每条消息。
+  if (options.recordArrival) {
+    const prevMs = Date.parse(input.lastConversationAt);
+    const gapMinutes = Number.isFinite(prevMs) ? (now.getTime() - prevMs) / 60_000 : Infinity;
+    if (wasSleeping || gapMinutes >= (options.arrivalGapMinutes ?? ARRIVAL_GAP_MINUTES)) {
+      const { hour } = localDayAndHour(now, options.timeZone ?? 'Asia/Shanghai');
+      const hist = state.arrivalHistogram;
+      for (let h = 0; h < 24; h += 1) hist[h] = Number((hist[h] * ARRIVAL_DECAY).toFixed(4));
+      hist[hour] = Number((hist[hour] + 1).toFixed(4));
     }
   }
 
@@ -481,7 +729,13 @@ export function settleAndApplyConversationEvent(input, event = {}, now = new Dat
     settled.state,
     event,
     now,
-    options.interaction ?? {},
+    {
+      ...(options.interaction ?? {}),
+      recordArrival: options.recordArrival === true,
+      timeZone: options.settle?.timeZone ?? options.timeZone,
+      arrivalGapMinutes: options.arrivalGapMinutes,
+      satisfactionPlateauHours: options.settle?.satisfactionPlateauHours,
+    },
   );
   return {
     ...applied,
@@ -552,6 +806,64 @@ export function applyDriveFeedback(input, feedback = {}, now = new Date()) {
   return state;
 }
 
+// ── Output reflux ─────────────────────────────────────────────────
+// 他自己产出的一次自主表达（自主念头 / 白天浮现），回过头改变自己的状态。
+// 不直接改驱力，而是在思维池里留痕，让收敛交给既有的张力系统（见 reinforceThought）。
+export function applyOutputReflux(input, driveKey, text = '', now = new Date(), amount = 0.30, metadata = {}) {
+  const state = ensureStateShape(structuredClone(input));
+  if (!DRIVE_KEYS.includes(driveKey)) {
+    return { state, applied: false, reasonCode: 'unknown_drive', key: driveKey || null };
+  }
+  state.thoughtPool ??= newThoughtPool();
+  const result = reinforceThought(state.thoughtPool, driveKey, text, amount, metadata);
+  state.revision += 1;
+  return {
+    state,
+    applied: true,
+    reasonCode: 'reinforced',
+    key: driveKey,
+    intensity: result.intensity,
+    seeded: result.seeded,
+  };
+}
+
+// ── Memory resonance ──────────────────────────────────────────────
+// 记忆反推驱力：浮现的记忆按 domain→亲和度，把对应驱力轻轻顶上去（"想起什么"影响"想要什么"）。
+// 和驱力偏置召回是一对：召回让强驱力浮出相关记忆，共振让浮出的记忆再回推驱力——闭环但有界：
+// 多 domain 取最大不累加、单次总量封顶、nudge 很小，加上 3A 的天花板松弛会把它拉回静息。
+export function applyMemoryResonance(input, domains = [], now = new Date(), options = {}) {
+  const state = ensureStateShape(structuredClone(input));
+  const nudge = clamp(Number(options.nudge ?? 0.02), 0, 0.1);
+  const perCallCap = clamp(Number(options.perCallCap ?? 0.06), 0, 0.5);
+
+  // 合并所有命中 domain 的亲和度，每维取最大值（不累加）。
+  const affinity = {};
+  for (const raw of Array.isArray(domains) ? domains : []) {
+    const map = DOMAIN_AFFINITY[String(raw ?? '').trim()];
+    if (!map) continue;
+    for (const [key, value] of Object.entries(map)) {
+      if (!DRIVE_KEYS.includes(key)) continue;
+      affinity[key] = Math.max(affinity[key] ?? 0, Number(value) || 0);
+    }
+  }
+
+  const applied = {};
+  for (const [key, aff] of Object.entries(affinity)) {
+    if (aff < RESONANCE_MIN_AFFINITY) continue;
+    const delta = Math.min(nudge * aff, perCallCap);
+    const before = Number(state.drives[key]);
+    const after = Number(clamp(before + delta).toFixed(4));
+    if (after !== before) {
+      state.drives[key] = after;
+      applied[key] = Number((after - before).toFixed(4));
+    }
+  }
+
+  const changed = Object.keys(applied).length > 0;
+  if (changed) state.revision += 1;
+  return { state, applied, changed, reasonCode: changed ? 'resonated' : 'no_affinity' };
+}
+
 export function activeSessionOverlay(input, sessionId, now = new Date()) {
   const state = ensureStateShape(structuredClone(input));
   const key = String(sessionId ?? '').trim();
@@ -561,6 +873,74 @@ export function activeSessionOverlay(input, sessionId, now = new Date()) {
   const expiresAt = Date.parse(overlay.expiresAt ?? '');
   if (Number.isFinite(expiresAt) && expiresAt <= now.getTime()) return null;
   return structuredClone(overlay);
+}
+
+// ── Anticipation (作息预期) ────────────────────────────────────────
+// 从她真实到达的节律直方图里，算出此刻"她差不多该来了"的期待感（0-1）。
+// 派生值，不落状态——用到时现算。三重克制：数据太少不臆测；她的静默时段（此刻几乎从不来，
+// 多半在睡）返回 0，不做"她怎么还不来"的等待；刚聊过（idle 短）也不期待，已兑现。
+// 过了她的高峰时段而她没来，relative 自然回落，期待安静地淡掉，绝不升级成责备。
+export function computeAnticipation(state, now = new Date(), options = {}) {
+  const tz = options.timeZone ?? 'Asia/Shanghai';
+  const hist = Array.isArray(state.arrivalHistogram) ? state.arrivalHistogram : [];
+  const total = hist.reduce((sum, n) => sum + (Number(n) || 0), 0);
+  if (total < (options.minSamples ?? 8)) return 0;
+  const { hour } = localDayAndHour(now, tz);
+  const p = (h) => (Number(hist[((h % 24) + 24) % 24]) || 0) / total;
+  const windowAt = (h) => p(h) + 0.6 * p(h + 1) + 0.3 * p(h - 1); // 此刻并探入下一小时
+  const windowScore = windowAt(hour);
+  let peak = 0;
+  for (let h = 0; h < 24; h += 1) peak = Math.max(peak, windowAt(h));
+  if (peak <= 0) return 0;
+  const relative = windowScore / peak; // 0-1：此刻离她高峰到达时段多近
+  if (relative < (options.quietGate ?? 0.15)) return 0; // 她的静默时段：她在睡，别等
+  const prevMs = Date.parse(state.lastConversationAt);
+  const idleH = Number.isFinite(prevMs) ? Math.max(0, (now.getTime() - prevMs) / 3_600_000) : 0;
+  const idleFactor = clamp(idleH / (options.expectIdleHours ?? 3), 0, 1); // 刚聊过就不用期待
+  return Number((relative * idleFactor).toFixed(3));
+}
+
+// 挂念：作息预期的另一半。她过了常来的点还没来 → 惦记，但"失落内化"——只在她本来活跃的
+// 时段念（她的静默时段多半在睡，返回 0，绝不半夜"她怎么还不来"），从 onset 起念、full 满。
+// 派生值不落状态。和 computeAnticipation 成对：期待是"她快来了"，挂念是"她久没来、我想她了"。
+export function computeLonging(state, now = new Date(), options = {}) {
+  const tz = options.timeZone ?? 'Asia/Shanghai';
+  const hist = Array.isArray(state.arrivalHistogram) ? state.arrivalHistogram : [];
+  const total = hist.reduce((sum, n) => sum + (Number(n) || 0), 0);
+  if (total < (options.minSamples ?? 8)) return 0;
+  const prevMs = Date.parse(state.lastConversationAt);
+  if (!Number.isFinite(prevMs)) return 0;
+  const idleH = Math.max(0, (now.getTime() - prevMs) / 3_600_000);
+  const onset = options.onsetHours ?? 6;
+  const full = options.fullHours ?? 18;
+  if (idleH <= onset) return 0; // 刚聊过/还没多久，不念
+  const byIdle = clamp((idleH - onset) / Math.max(1, full - onset), 0, 1);
+  const { hour } = localDayAndHour(now, tz);
+  const p = (h) => (Number(hist[((h % 24) + 24) % 24]) || 0) / total;
+  const windowAt = (h) => p(h) + 0.6 * p(h + 1) + 0.3 * p(h - 1);
+  let peak = 0;
+  for (let h = 0; h < 24; h += 1) peak = Math.max(peak, windowAt(h));
+  if (peak <= 0) return 0;
+  const activeness = clamp(windowAt(hour) / peak, 0, 1);
+  if (activeness < (options.quietGate ?? 0.15)) return 0; // 她这个点几乎不来（多半在睡）→ 不念
+  return Number((byIdle * activeness).toFixed(3));
+}
+
+// 把挂念落进数值：只推 monitor(惦记)，且硬顶在它的静息天花板(3A ceil)以内——
+// 绝不越顶，所以不会自激；她一回来 interaction 结算自然把它带下去。派生自 computeLonging。
+export function applyLongingNudge(input, longing = 0, now = new Date(), options = {}) {
+  const state = ensureStateShape(structuredClone(input));
+  const amount = clamp(Number(options.nudge ?? 0.02), 0, 0.1);
+  const cap = clamp(Number(options.cap ?? 0.04), 0, 0.2);
+  const ceil = Number.isFinite(DIMENSIONS.monitor?.ceil) ? DIMENSIONS.monitor.ceil : SATURATE_CEIL;
+  const before = Number(state.drives.monitor);
+  if (!(longing > 0) || before >= ceil) return { state, applied: 0, changed: false };
+  const delta = Math.min(amount * longing, cap, ceil - before);
+  if (delta <= 0) return { state, applied: 0, changed: false };
+  const after = Number(clamp(before + delta).toFixed(4));
+  state.drives.monitor = after;
+  if (after !== before) state.revision += 1;
+  return { state, applied: Number((after - before).toFixed(4)), changed: after !== before };
 }
 
 // ── Top drives ────────────────────────────────────────────────────
@@ -646,11 +1026,11 @@ export function scheduleDaytimeEmergence(input, now = new Date(), minHours = 2, 
   return state;
 }
 
-export function recordDaytimeEmergence(input, message, now = new Date(), timeZone = 'Asia/Shanghai') {
+export function recordDaytimeEmergence(input, message, now = new Date(), timeZone = 'Asia/Shanghai', { silent = false } = {}) {
   const state = structuredClone(input);
   const at = iso(now);
   const { day } = localDayAndHour(now, timeZone);
-  appendRecentBark(state, at, 'daytime_emergence', message);
+  if (!silent) appendRecentBark(state, at, 'daytime_emergence', message);
   state.lastDaytimeEmergenceAt = at;
   state.lastDaytimeMessage = message;
   state.daytimeEmergenceUsage ??= {};

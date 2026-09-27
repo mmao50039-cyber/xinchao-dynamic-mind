@@ -1,22 +1,36 @@
 import { createServer } from 'node:http';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { loadConfig, validateConfig } from './config.js';
-import { INTERACTION_TYPES, applyDriveFeedback, applyOmbreHeartbeat, barkAllowed, breathDreamContext, contactIdleAllowed, daytimeEmergenceAllowed, dreamAllowed, newState, pickIntent, proactiveBarkAllowed, recordBark, recordDaytimeEmergence, recordDream, scheduleDaytimeEmergence, settleAndApplyConversationEvent, settleState, topDrives } from './engine.js';
+import { emotionCoords, emotionSummary, stampEmotionArgs } from './emotion.js';
+import { recordSurfacing, resolveAwareness, scanAwareness, awarenessSummary } from './awareness.js';
+import { detectSelfSignals, renderNowLine, SELF_REPORT_TYPES } from './self-signals.js';
+import { BlackBox, renderBoxList } from './black-box.js';
+import { INTERACTION_TYPES, applyDriveFeedback, applyMemoryResonance, applyOmbreHeartbeat, applyOutputReflux, applyLongingNudge, barkAllowed, breathDreamContext, contactIdleAllowed, computeLonging, daytimeEmergenceAllowed, dreamAllowed, newState, pickIntent, proactiveBarkAllowed, recordBark, recordDaytimeEmergence, recordDream, scheduleDaytimeEmergence, settleAndApplyConversationEvent, settleState, topDrives, computeAnticipation, localDayAndHour, applySurfacedThought, surfacedDriveKey, recentSurfacedBucketIds, recordSurfacedBuckets } from './engine.js';
 import { buildInteractionBridgeMessage } from './interaction-messages.js';
 import { selectUniqueBark } from './bark-dedupe.js';
 import { StateStore } from './state-store.js';
 import { ModelClient } from './model-client.js';
-import { OmbreClient } from './ombre-client.js';
+import { OmbreClient, parseSurfacedDomains } from './ombre-client.js';
 import { BarkClient } from './bark-client.js';
 import { readOmbreHeartbeat } from './heartbeat-store.js';
-import { buildContextEnvelope, contextDeliveryState, recordContextDelivery } from './context-envelope.js';
+import { buildContextEnvelope, contextDeliveryState, recordContextDelivery, buildNowCompact } from './context-envelope.js';
 import { TransitionJournal } from './transition-journal.js';
 import { handleMcpMessage } from './mcp-protocol.js';
 import { OAuthProvider } from './oauth-provider.js';
 import { recordHandoffNote } from './handoff-notes.js';
 import { DashboardAuth } from './dashboard-auth.js';
 import { buildConnectionManifest, buildDashboardSnapshot } from './dashboard-projection.js';
-import { BRIDGE_SERVER_PROTOCOL, BRIDGE_STREAM_PROTOCOL, BridgeQueue } from './bridge-queue.js';
+import { BRIDGE_SERVER_PROTOCOL, BRIDGE_STREAM_PROTOCOL, BridgeQueue, bridgeDeliveryFromDashboard } from './bridge-queue.js';
+import { CabinStore } from './cabin-store.js';
+import { boardEnabled, postBoardMessage, readBoardMessages } from './board-client.js';
+import { SYSTEM_VERSION } from './version.js';
+import { memoryConnectionState } from './connection-diagnostics.js';
+import { PersonalityStore, computePersonalityStats } from './personality-store.js';
+
+// 情绪 → 记忆：只在开关打开时把此刻情绪坐标交给 OB 做共振排序。
+function emotionForOmbre(state) {
+  return config.ombre.emotionStamp ? emotionCoords(state) : null;
+}
 
 const config = validateConfig(loadConfig());
 if (!config.serviceToken) throw new Error('SERVICE_TOKEN is required');
@@ -31,6 +45,7 @@ if (config.serviceToken.length < 32) {
 const store = new StateStore(config.statePath, () => newState());
 const model = new ModelClient(config.model);
 const ombre = new OmbreClient(config.ombre);
+const blackBox = new BlackBox(config.box.statePath);
 const bark = new BarkClient(config.bark);
 const journal = new TransitionJournal(config.journalPath);
 const oauth = new OAuthProvider(config.oauth, (event, fields = {}) => log(event, fields));
@@ -40,10 +55,11 @@ const dashboardAuth = new DashboardAuth({
   secureCookies: config.dashboard.publicBaseUrl.startsWith('https://'),
 });
 const bridgeQueue = new BridgeQueue(config.bridge.statePath, config.bridge);
+const cabin = new CabinStore(config.cabin.statePath, config.cabin);
+const personality = new PersonalityStore(config.personalityPath);
 const bridgeStreams = new Set();
 await oauth.init();
 let cyclePromise = null;
-const SYSTEM_VERSION = '2.6.0';
 
 function log(event, fields = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), event, ...fields }));
@@ -98,50 +114,198 @@ async function synchronizeOmbreHeartbeat() {
   return state;
 }
 
+
+async function materialFromReferencedBuckets(recalled, maxLines = 7) {
+  const ids = recalled?.bucketIds ?? [];
+  if (!ids.length) return recalled?.text ?? '';
+  try {
+    const previews = await ombre.memoryBucketPreviews(ids, maxLines);
+    const domains = [...new Set(recalled?.domains ?? [])];
+    const domainMeta = domains.length ? `[domain:${domains.join(',')}]\n` : '';
+    const text = previews.map((item) => `${domainMeta}[bucket_id:${item.id}]\n${item.preview}`).join('\n\n');
+    return text || recalled?.text || '';
+  } catch (error) {
+    log('ombre_preview_failed', { count: ids.length, message: error.message });
+    return recalled?.text ?? '';
+  }
+}
+
+// 梦的推送（从 runCycle 里搬出来，3.3 改成早上发）：生成一句、去重、发 Bark、回流。
+async function sendDreamPush(state, dream, now) {
+  try {
+    let modelFailed = false;
+    const selected = await selectUniqueBark({
+      state,
+      onRejected: ({ attempt, similarity }) => log('bark_duplicate_rejected', { kind: 'dream', attempt, similarity }),
+      generate: async ({ recentMessages, rejectedMessage }) => {
+        if (modelFailed) return dream.residue;
+        try {
+          return await model.generateDreamPush({ dream, recentMessages, rejectedMessage });
+        } catch (error) {
+          modelFailed = true;
+          log('dream_push_model_failed', { message: error.message });
+          return dream.residue;
+        }
+      },
+    });
+    if (selected.reason === 'duplicate') log('bark_duplicate_skipped', { kind: 'dream', attempts: selected.attempts });
+    if (!selected.message) return state;
+    const result = await bark.send(selected.message);
+    if (!result.sent) return state;
+    state = await updateState({ type: 'bark_sent', source: 'bark', details: { barkSent: true, kind: 'dream' }, at: now },
+      (latest) => recordBark(latest, now, { kind: 'dream', message: selected.message }));
+    log('bark_sent', { kind: 'dream', revision: state.revision });
+    if (config.reflux.enabled) {
+      const expressed = topDrives(state)[0];
+      if (expressed) {
+        state = await updateState({ type: 'output_reflux', source: 'reflux', details: { kind: 'dream', drive: expressed.key }, at: now },
+          (latest) => applyOutputReflux(latest, expressed.key, selected.message, now, config.reflux.amount).state);
+        log('output_reflux', { kind: 'dream', drive: expressed.key, revision: state.revision });
+      }
+    }
+  } catch (error) { log('bark_failed', { kind: 'dream', message: error.message }); }
+  return state;
+}
+
 async function runCycle() {
   if (cyclePromise) return cyclePromise;
   cyclePromise = (async () => {
     const now = new Date();
     await synchronizeOmbreHeartbeat();
+    const driveBias = await personality.getDriveBias(now);
     let settled;
     await updateState({
       type: 'settle',
       source: 'timer',
       at: now,
     }, (state) => {
-      settled = settleState(state, now, config.sleepAfterMinutes, config.settle);
+      settled = settleState(state, now, config.sleepAfterMinutes, { ...config.settle, driveBias });
       return settled.state;
     });
 
     let state = settled.state;
+    // 自我觉察：每天扫一次（上海日期变了才扫），从轨迹里挑候选。只加候选，不动别的。
+    if (config.awareness.enabled) {
+      const preview = scanAwareness(state, now, { timeZone: config.settle.timeZone });
+      if (preview.changed) {
+        state = await updateState({
+          type: 'awareness_scan',
+          source: 'timer',
+          details: { added: preview.added.length, kinds: preview.added.map((c) => c.kind) },
+          at: now,
+        }, (latest) => scanAwareness(latest, now, { timeZone: config.settle.timeZone }).state);
+        if (preview.added.length) log('awareness_candidates', { added: preview.added.map((c) => `${c.kind}:${c.subject}`) });
+      }
+    }
+    // 黑匣子到点提醒：到时自动露头；桥开着就再递一句到窗口（只说标题，不说正文）。
+    try {
+      const due = await blackBox.dueReminders(now);
+      if (due.length) log('box_reminders_due', { count: due.length });
+      if (due.length && config.bridge.enabled && config.bridge.selfSignals) {
+        for (const item of due) {
+          const title = item.title || `${item.text.slice(0, 20)}${item.text.length > 20 ? '…' : ''}`;
+          try {
+            await bridgeQueue.enqueue({ eventId: `box-remind-${item.id}`, reason: 'self_signal', message: `匣子里有一条到点了：${title}${item.when ? `（事在 ${item.when.slice(5, 10).replace('-', '/')}）` : ''}。xinchao_box read ${item.id}`, ttlHours: 12 }, now);
+          } catch (error) { log('box_reminder_enqueue_failed', { id: item.id, message: error.message }); }
+        }
+        await publishReadyBridgeDeliveries();
+      }
+    } catch (error) { log('box_reminders_failed', { message: error.message }); }
+    // 心潮自身信号（3.3）：检测"发生了什么"，经桥递到窗口。先入队再记状态，入队失败不记（下轮再试）。
+    if (config.bridge.enabled && config.bridge.selfSignals) {
+      const preview = detectSelfSignals(state, now, { timeZone: config.settle.timeZone, dawnFreezeStart: config.settle.dawnFreezeStart, dawnFreezeEnd: config.settle.dawnFreezeEnd, awarenessReviewWeekday: config.awareness.reviewWeekday, longing: { timeZone: config.settle.timeZone, ...config.longing } });
+      if (preview.signals.length) {
+        let queued = 0;
+        for (const signal of preview.signals) {
+          try {
+            await bridgeQueue.enqueue({ eventId: signal.eventId, reason: 'self_signal', message: signal.text, ttlHours: preview.ttlHours }, now);
+            queued += 1;
+          } catch (error) { log('self_signal_enqueue_failed', { kind: signal.kind, message: error.message }); }
+        }
+        if (queued) await publishReadyBridgeDeliveries();
+      }
+      if (preview.changed) {
+        state = await updateState({
+          type: 'self_signals',
+          source: 'timer',
+          details: { signals: preview.signals.map((s) => `${s.kind}:${s.subject}`) },
+          at: now,
+        }, (latest) => detectSelfSignals(latest, now, { timeZone: config.settle.timeZone, dawnFreezeStart: config.settle.dawnFreezeStart, dawnFreezeEnd: config.settle.dawnFreezeEnd, awarenessReviewWeekday: config.awareness.reviewWeekday, longing: { timeZone: config.settle.timeZone, ...config.longing } }).state);
+        if (preview.signals.length) log('self_signals', { kinds: preview.signals.map((s) => `${s.kind}:${s.subject}`) });
+      }
+    }
     let dreamCreated = false;
     let barkSent = false;
     let daytimeSent = false;
+
+    // 挂念：她过了常来的点还没来 → 轻推 monitor(惦记) 进数值（不只在上下文）。
+    // applyLongingNudge 硬顶在 3A 天花板内、不自激；她的静默时段 computeLonging 返回 0，不念。
+    if (config.longing.enabled) {
+      const longing = computeLonging(state, now, { timeZone: config.settle.timeZone, ...config.longing });
+      const preview = longing > 0 ? applyLongingNudge(state, longing, now, config.longing) : { changed: false };
+      if (preview.changed) {
+        state = await updateState({
+          type: 'longing_nudge',
+          source: 'longing',
+          details: { longing: Number(longing.toFixed(3)), applied: preview.applied },
+          at: now,
+        }, (latest) => applyLongingNudge(latest, longing, now, config.longing).state);
+        log('longing_nudge', { longing: Number(longing.toFixed(3)), applied: preview.applied, revision: state.revision });
+      }
+    }
     // Dream residue follows a short quiet period; autonomous contact remains
     // reserved for a genuine long absence.
     const dreamContactIsIdle = contactIdleAllowed(state, now, config.heartbeat.dreamMinIdleHours);
     const proactiveContactIsIdle = contactIdleAllowed(state, now, config.heartbeat.proactiveMinIdleHours);
 
-    if (dreamAllowed(state, now, config.dreamMinIntervalHours, config.dreamMaxPerDay)) {
+    if (config.dreamEnabled && dreamAllowed(state, now, config.dreamMinIntervalHours, config.dreamMaxPerDay)) {
       let material = '';
+      let sourceOmbreBucketIds = [];
       if (!config.shadowMode && config.ombre.readEnabled) {
-        try { material = await ombre.recentMaterial(topDrives(state)); }
+        try {
+          // 3.3：原料换成"记忆正在消化的东西"（OB dream 全量，去技术类），消化里没东西再退回按驱力捞
+          const digest = await ombre.digestMaterial(48);
+          if (digest.text) { material = digest.text; sourceOmbreBucketIds = digest.bucketIds; }
+          else {
+            const recalled = await ombre.recentMaterialWithRefs(topDrives(state), emotionForOmbre(state));
+            sourceOmbreBucketIds = recalled.bucketIds;
+            material = await materialFromReferencedBuckets(recalled);
+          }
+          log('dream_material', { digestTotal: digest.total, kept: digest.kept, domains: digest.domains.slice(0, 8).join(',') });
+        }
         catch (error) { log('ombre_read_failed', { message: error.message }); }
       }
+      let farMaterial = '';
+      if (!config.shadowMode && config.ombre.readEnabled) {
+        try { const far = await ombre.farMaterial(now); farMaterial = far.text; sourceOmbreBucketIds = [...new Set([...sourceOmbreBucketIds, ...far.bucketIds])]; }
+        catch (error) { log('ombre_far_failed', { message: error.message }); }
+      }
+      const avoid = state.recentDreams.slice(-3).map((d) => d.image || String(d.residue || '').slice(0, 30)).filter(Boolean);
+      const sleepHours = state.sleepStartedAt ? (now.getTime() - Date.parse(state.sleepStartedAt)) / 3_600_000 : null;
 
       let generated;
       if (config.shadowMode) {
         generated = new ModelClient({ ...config.model, enabled: false }).fallback(topDrives(state));
       } else {
         try {
-          generated = await model.generateDream({ state, material, topDrives: topDrives(state) });
+          generated = await model.generateDream({ state, material, farMaterial, topDrives: topDrives(state), avoid, emotion: emotionSummary(state, now), sleepHours });
         } catch (error) {
           log('dream_model_failed', { message: error.message });
           generated = new ModelClient({ ...config.model, enabled: false }).fallback(topDrives(state));
         }
       }
 
-      const dream = { id: randomUUID(), createdAt: now.toISOString(), ...generated, ombreBucketId: null };
+      const dream = {
+        id: randomUUID(),
+        createdAt: now.toISOString(),
+        ...generated,
+        // ombreBucketId 保持旧语义：这场梦写入 OB 后自己的桶。
+        ombreBucketId: null,
+        // 新字段只记梦由哪些真实记忆长出，老状态没有它也完全可读。
+        sourceOmbreBucketIds,
+        driveKey: topDrives(state)[0]?.key ?? null,
+        sleepHours: sleepHours == null ? null : Number(sleepHours.toFixed(2)),
+      };
       if (!config.shadowMode && config.ombre.writeEnabled) {
         try { dream.ombreBucketId = await ombre.storeDream(dream); }
         catch (error) { log('ombre_write_failed', { message: error.message }); }
@@ -159,40 +323,29 @@ async function runCycle() {
       dreamCreated = true;
       log('dream_settled', { source: dream.source, shadow: config.shadowMode, usedBreath: Boolean(material), revision: state.revision });
 
-      if (!config.shadowMode && config.bark.enabled && dreamContactIsIdle && barkAllowed(state, now, config.bark.minIntervalHours, config.bark.maxPerDay, 'dream')) {
-        try {
-          let modelFailed = false;
-          const selected = await selectUniqueBark({
-            state,
-            onRejected: ({ attempt, similarity }) => log('bark_duplicate_rejected', { kind: 'dream', attempt, similarity }),
-            generate: async ({ recentMessages, rejectedMessage }) => {
-              if (modelFailed) return dream.residue;
-              try {
-                return await model.generateDreamPush({ dream, recentMessages, rejectedMessage });
-              } catch (error) {
-                modelFailed = true;
-                log('dream_push_model_failed', { message: error.message });
-                return dream.residue;
-              }
-            },
-          });
-          if (selected.reason === 'duplicate') {
-            log('bark_duplicate_skipped', { kind: 'dream', attempts: selected.attempts });
-          }
-          if (selected.message) {
-            const result = await bark.send(selected.message);
-            if (result.sent) {
-              state = await updateState({
-                type: 'bark_sent',
-                source: 'bark',
-                details: { barkSent: true, kind: 'dream' },
-                at: now,
-              }, (latest) => recordBark(latest, now, { kind: 'dream', message: selected.message }));
-              barkSent = true;
-              log('bark_sent', { kind: 'dream', revision: state.revision });
-            }
-          }
-        } catch (error) { log('bark_failed', { kind: 'dream', message: error.message }); }
+      // 3.3：梦做完不在凌晨推。攒着，到她常来的点前后再推"昨晚梦到……"（见下面 pendingDreamPush）。
+      if (!config.shadowMode && config.bark.enabled) {
+        state = await updateState({ type: 'dream_push_pending', source: 'dream', details: { dreamId: dream.id }, at: now },
+          (latest) => ({ ...latest, pendingDreamPush: { dreamId: dream.id, createdAt: now.toISOString() } }));
+      }
+    }
+
+    // 早上推梦：她常来的点前后（期待 ≥0.3）或 9 点之后；14 小时没推出去就作废；仍受 Bark 总闸和 3 小时空档。
+    if (!config.shadowMode && config.bark.enabled && state.pendingDreamPush) {
+      const pending = state.pendingDreamPush;
+      const ageH = (now.getTime() - Date.parse(pending.createdAt)) / 3_600_000;
+      const { hour } = localDayAndHour(now, config.settle.timeZone);
+      const dream = state.recentDreams.find((d) => d.id === pending.dreamId);
+      const anticipation = computeAnticipation(state, now, { timeZone: config.settle.timeZone });
+      const morning = hour >= 8 && (anticipation >= 0.3 || hour >= 9);
+      if (!dream || ageH > 14) {
+        state = await updateState({ type: 'dream_push_dropped', source: 'dream', details: { dreamId: pending.dreamId, ageH: Number(ageH.toFixed(1)) }, at: now },
+          (latest) => ({ ...latest, pendingDreamPush: null }));
+        log('dream_push_dropped', { dreamId: pending.dreamId, ageH: Number(ageH.toFixed(1)) });
+      } else if (morning && dreamContactIsIdle && barkAllowed(state, now, config.bark.minIntervalHours, config.bark.maxPerDay, 'dream')) {
+        state = await sendDreamPush(state, dream, now);
+        state = await updateState({ type: 'dream_push_sent', source: 'dream', details: { dreamId: dream.id }, at: now },
+          (latest) => ({ ...latest, pendingDreamPush: null }));
       }
     }
 
@@ -202,9 +355,30 @@ async function runCycle() {
       // 只取一次：selectUniqueBark 去重失败时会重试生成，材料跟着重取的话
       // 一条通知能打出好几次 OB 往返，而浮现的东西本来就该是同一件事。
       let thoughtMaterial = '';
+      let thoughtSourceBucketIds = [];
       if (config.ombre.readEnabled) {
-        try { thoughtMaterial = await ombre.thoughtMaterial(topDrives(state)); }
+        try {
+          const recalled = await ombre.thoughtMaterialWithRefs(topDrives(state), emotionForOmbre(state), now, recentSurfacedBucketIds(state, now));
+          thoughtSourceBucketIds = recalled.bucketIds;
+          if (recalled.bucketIds.length) {
+            state = await updateState({ type: 'surfaced_buckets', source: 'autonomous', details: { count: recalled.bucketIds.length }, at: now },
+              (latest) => recordSurfacedBuckets(latest, recalled.bucketIds, now));
+          }
+          thoughtMaterial = await materialFromReferencedBuckets(recalled, 5);
+        }
         catch (error) { log('ombre_read_failed', { message: error.message }); }
+      }
+      if (config.resonance.enabled && thoughtMaterial) {
+        const domains = parseSurfacedDomains(thoughtMaterial);
+        if (domains.length) {
+          state = await updateState({
+            type: 'memory_resonance',
+            source: 'resonance',
+            details: { kind: 'autonomous_thought', domains: domains.slice(0, 8).join(',') },
+            at: now,
+          }, (latest) => { const next = applyMemoryResonance(latest, domains, now, config.resonance).state; recordSurfacing(next, domains, now); return next; });
+          log('memory_resonance', { kind: 'autonomous_thought', domains: domains.length, revision: state.revision });
+        }
       }
       try {
         selected = await selectUniqueBark({
@@ -240,6 +414,28 @@ async function runCycle() {
             }, (latest) => recordBark(latest, now, { kind: 'autonomous_thought', message: selected.message }));
             barkSent = true;
             log('bark_sent', { kind: 'autonomous_thought', source: selected.candidate?.source, revision: state.revision });
+            if (config.reflux.enabled) {
+              const expressed = topDrives(state)[0];
+              if (expressed) {
+                state = await updateState({
+                  type: 'output_reflux',
+                  source: 'reflux',
+                  details: { kind: 'autonomous_thought', drive: expressed.key },
+                  at: now,
+                }, (latest) => applyOutputReflux(
+                  latest,
+                  expressed.key,
+                  selected.message,
+                  now,
+                  config.reflux.amount,
+                  {
+                    ombreBucketId: thoughtSourceBucketIds[0] ?? null,
+                    sourceOmbreBucketIds: thoughtSourceBucketIds,
+                  },
+                ).state);
+                log('output_reflux', { kind: 'autonomous_thought', drive: expressed.key, revision: state.revision });
+              }
+            }
           }
         } catch (error) { log('bark_failed', { kind: 'autonomous_thought', message: error.message }); }
       }
@@ -252,11 +448,47 @@ async function runCycle() {
         at: now,
       }, (latest) => scheduleDaytimeEmergence(latest, now, config.daytime.minIntervalHours, config.daytime.maxIntervalHours));
       log('daytime_emergence_scheduled', { nextAt: state.nextDaytimeEmergenceAt, revision: state.revision });
-    } else if (!config.shadowMode && config.daytime.enabled && config.ombre.readEnabled && config.bark.enabled && daytimeEmergenceAllowed(state, now, config.daytime)) {
+    } else if (!config.shadowMode && config.daytime.enabled && config.ombre.readEnabled && (!config.daytime.bark || config.bark.enabled) && daytimeEmergenceAllowed(state, now, config.daytime)) {
       let selected = { message: '', candidate: { source: 'none' }, reason: 'empty', attempts: 1 };
       try {
-        const material = await ombre.daytimeMaterial(topDrives(state));
+        const recalled = await ombre.daytimeMaterialWithRefs(topDrives(state), emotionForOmbre(state), now, recentSurfacedBucketIds(state, now));
+        if (recalled.bucketIds.length) {
+          state = await updateState({ type: 'surfaced_buckets', source: 'daytime', details: { count: recalled.bucketIds.length }, at: now },
+            (latest) => recordSurfacedBuckets(latest, recalled.bucketIds, now));
+        }
+        const material = await materialFromReferencedBuckets(recalled, 5);
+        if (config.resonance.enabled && material) {
+          const domains = parseSurfacedDomains(material);
+          if (domains.length) {
+            state = await updateState({
+              type: 'memory_resonance',
+              source: 'resonance',
+              details: { kind: 'daytime_emergence', domains: domains.slice(0, 8).join(',') },
+              at: now,
+            }, (latest) => { const next = applyMemoryResonance(latest, domains, now, config.resonance).state; recordSurfacing(next, domains, now); return next; });
+            log('memory_resonance', { kind: 'daytime_emergence', domains: domains.length, revision: state.revision });
+          }
+        }
+        // 浮现 → 念头池：不代笔，不推她。取这次浮现的第一句当闪念，挂在最亲和的那一维上。
         if (material.trim()) {
+          const domains = parseSurfacedDomains(material);
+          const key = surfacedDriveKey(domains, state);
+          const firstLine = material.split('\n').map((l) => l.trim()).find((l) => l && !/^\[/.test(l)) || '';
+          if (key && firstLine) {
+            state = await updateState({
+              type: 'surfaced_thought',
+              source: 'daytime',
+              details: { drive: key, domains: domains.slice(0, 6).join(',') },
+              at: now,
+            }, (latest) => applySurfacedThought(latest, key, firstLine, now, 0.45, { ombreBucketId: recalled.bucketIds[0] ?? null, sourceOmbreBucketIds: recalled.bucketIds }).state);
+            log('surfaced_thought', { drive: key, domains: domains.length, revision: state.revision });
+          }
+          if (!config.daytime.bark) {
+            state = await updateState({ type: 'daytime_emergence_noted', source: 'daytime', at: now },
+              (latest) => recordDaytimeEmergence(latest, firstLine, now, config.daytime.timeZone, { silent: true }));
+          }
+        }
+        if (material.trim() && config.daytime.bark) {
           selected = await selectUniqueBark({
             state,
             onRejected: ({ attempt, similarity }) => log('bark_duplicate_rejected', { kind: 'daytime_emergence', attempt, similarity }),
@@ -281,11 +513,33 @@ async function runCycle() {
             }, (latest) => recordDaytimeEmergence(latest, selected.message, now, config.daytime.timeZone));
             daytimeSent = true;
             log('bark_sent', { kind: 'daytime_emergence', source: selected.candidate?.source, revision: state.revision });
+            if (config.reflux.enabled) {
+              const expressed = topDrives(state)[0];
+              if (expressed) {
+                state = await updateState({
+                  type: 'output_reflux',
+                  source: 'reflux',
+                  details: { kind: 'daytime_emergence', drive: expressed.key },
+                  at: now,
+                }, (latest) => applyOutputReflux(
+                  latest,
+                  expressed.key,
+                  selected.message,
+                  now,
+                  config.reflux.amount,
+                  {
+                    ombreBucketId: recalled.bucketIds[0] ?? null,
+                    sourceOmbreBucketIds: recalled.bucketIds,
+                  },
+                ).state);
+                log('output_reflux', { kind: 'daytime_emergence', drive: expressed.key, revision: state.revision });
+              }
+            }
           }
         } catch (error) {
           log('bark_failed', { kind: 'daytime_emergence', message: error.message });
         }
-      } else {
+      } else if (config.daytime.bark) {
         log('daytime_emergence_skipped', { reason: selected.reason === 'duplicate' ? 'duplicate' : 'no_pushworthy_material' });
       }
       state = await updateState({
@@ -374,32 +628,24 @@ async function body(request) {
   let raw = '';
   for await (const chunk of request) {
     raw += chunk;
-    if (raw.length > 64 * 1024) throw new Error('request body too large');
+    if (raw.length > 1024 * 1024) throw new Error('request body too large');
   }
   return raw ? JSON.parse(raw) : {};
 }
 
 /**
- * 浏览器直连模式的跨源放行。
- *
- * 心潮和浏览器在同一台机器上时（自己电脑、或手机 Termux），网页前端可以
- * 不经过任何中间服务器直接读这台心潮 —— 数据一步都不出本机。
- *
- * 默认不放行任何来源：只有部署方把来源写进 DASHBOARD_ALLOWED_ORIGINS 才生效，
- * 不填时行为与以前逐字节相同。
- *
- * 刻意不发 Access-Control-Allow-Credentials：直连用 Authorization 头鉴权，
- * 不需要跨源 Cookie，也就不给 Cookie 留任何口子。
+ * 只为 Dashboard 浏览器直连开放受控 CORS。
+ * 默认不放行；部署者必须把完整前端来源写入 DASHBOARD_ALLOWED_ORIGINS。
+ * 直连只使用 Authorization 会话头，不开放跨源 Cookie。
  */
 function applyDashboardCors(request, response, url) {
   if (!url.pathname.startsWith('/dashboard/')) return false;
   const origin = String(request.headers.origin ?? '').replace(/\/$/, '');
   if (!origin) return false;
-  // 无论放不放行都要声明 Vary，否则中间缓存可能把一个来源的响应喂给另一个。
   response.setHeader('Vary', 'Origin');
   if (!config.dashboard.allowedOrigins.includes(origin)) return false;
   response.setHeader('Access-Control-Allow-Origin', origin);
-  response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
   response.setHeader('Access-Control-Max-Age', '600');
   return true;
@@ -428,7 +674,12 @@ function dashboardTimelineOptions(url) {
 
 async function dashboardPayload(pathname, url) {
   if (pathname.endsWith('/snapshot')) {
-    return buildDashboardSnapshot(await store.read(), config, new Date());
+    const now = new Date();
+    const [state, personalityCore] = await Promise.all([
+      store.read(),
+      personality.getPersonalityCore(now),
+    ]);
+    return buildDashboardSnapshot(state, config, now, personalityCore);
   }
   if (pathname.endsWith('/timeline')) {
     return {
@@ -437,7 +688,66 @@ async function dashboardPayload(pathname, url) {
       items: await journal.list(dashboardTimelineOptions(url)),
     };
   }
+  if (pathname.endsWith('/memory-map')) {
+    if (!config.ombre.readEnabled) {
+      return {
+        schemaVersion: 2,
+        generatedAt: new Date().toISOString(),
+        available: false,
+        reason: memoryConnectionState(config),
+        total: 0,
+        stats: {},
+        stars: [],
+        edges: [],
+        capabilities: {
+          explicitRelations: false,
+          driveSnapshots: false,
+          driveAffinity: false,
+          timestamps: false,
+        },
+      };
+    }
+    try {
+      return await ombre.memoryMap();
+    } catch (error) {
+      log('dashboard_memory_map_failed', { message: error.message });
+      return {
+        schemaVersion: 2,
+        generatedAt: new Date().toISOString(),
+        available: false,
+        reason: 'ombre_unavailable',
+        total: 0,
+        stats: {},
+        stars: [],
+        edges: [],
+        capabilities: {
+          explicitRelations: false,
+          driveSnapshots: false,
+          driveAffinity: false,
+          timestamps: false,
+        },
+      };
+    }
+  }
+  if (pathname.endsWith('/memory-bucket')) {
+    const bucketId = String(url.searchParams.get('id') ?? '').trim();
+    if (!/^[A-Za-z0-9._-]{1,160}$/.test(bucketId)) {
+      return { schemaVersion: 1, available: false, reason: 'invalid_id', id: bucketId, preview: '', lineCount: 0, truncated: false };
+    }
+    try {
+      return await ombre.memoryBucketPreview(bucketId, 7);
+    } catch (error) {
+      log('dashboard_memory_bucket_failed', { bucket: auditEventFingerprint(bucketId), message: error.message });
+      return { schemaVersion: 1, available: false, reason: 'ombre_unavailable', id: bucketId, preview: '', lineCount: 0, truncated: false };
+    }
+  }
   if (pathname.endsWith('/connect')) return buildConnectionManifest(config);
+  if (pathname.endsWith('/cabin')) return cabin.snapshot();
+  if (pathname.endsWith('/personality')) return personality.getPersonalityCore();
+  if (pathname.endsWith('/pending')) {
+    // 3.3：攒下的话退役，黑匣子接替。人类看不到匣子，这里只回一个说明，不回条目。
+    return { schemaVersion: 2, generatedAt: new Date().toISOString(), retired: true, items: [], note: '攒下的话已并入黑匣子（只有 AI 能看）；这一页可以下线了。' };
+  }
   return null;
 }
 
@@ -472,24 +782,49 @@ async function createContextEnvelope({
     && config.ombre.readEnabled
   ) {
     try {
-      ombreText = await ombre.recentContinuityMaterial(config.context.ombreMaxTokens);
+      ombreText = await ombre.recentContinuityMaterial(config.context.ombreMaxTokens, emotionForOmbre(state));
     } catch (error) {
       ombreWarning = 'ombre_unavailable';
       log('context_ombre_read_failed', { message: error.message });
     }
   }
+  // 行为锚点随信封下发（缓存读取，极便宜）；读不到就当没有，不阻塞信封。
+  let personalityAnchors = [];
+  try { personalityAnchors = (await personality.getPersonalityCore(now)).anchors ?? []; } catch { personalityAnchors = []; }
+  let boxCount = 0; let boxSurfaced = [];
+  try { boxCount = await blackBox.count(now); boxSurfaced = await blackBox.surfaced(now); } catch { boxCount = 0; boxSurfaced = []; }
+  // 官方客户端版：没被 Bridge 接走的自身信号，在这里带出去（带出即 delivered）；小屋 24h 内的来信只报条数。
+  let awaySignals = [];
+  if (config.bridge.enabled) {
+    try {
+      awaySignals = (await bridgeQueue.ready(now)).filter((d) => d.reason === 'self_signal').slice(-5)
+        .map((d) => ({ id: d.id, createdAt: d.createdAt, text: String(d.message ?? '').split('\n')[0] }));
+    } catch { awaySignals = []; }
+  }
+  let cabinRecent = 0;
+  try { cabinRecent = (await cabin.unlockedUserNotes()).filter((n) => now.getTime() - Date.parse(n.createdAt) < 24 * 3_600_000).length; } catch { cabinRecent = 0; }
   const envelope = buildContextEnvelope({
+    awarenessReviewWeekday: config.awareness.reviewWeekday,
     state,
     sessionId,
     mode,
+    boxCount,
+    boxSurfaced,
+    awaySignals,
+    cabinRecent,
     ombreText,
     maxTokens,
     ttlMinutes: config.context.ttlMinutes,
     now,
     alreadyDelivered: delivery.alreadyDelivered,
     force,
+    timeZone: config.settle.timeZone,
+    personalityAnchors,
   });
   if (envelope.delivered) {
+    for (const sig of awaySignals) {
+      try { await bridgeQueue.acknowledge(sig.id, 'delivered', '', now); } catch { /* 回执失败下次再带 */ }
+    }
     state = await updateState({
       type: 'context_delivery',
       source: 'context-adapter',
@@ -503,12 +838,15 @@ async function createContextEnvelope({
         sectionCount: envelope.sections.length,
       },
       at: now,
-    }, (current) => recordContextDelivery(current, {
-      sessionId,
-      mode,
-      digest: envelope.digest,
-      deliveredAt: now,
-    }));
+    }, (current) => {
+      const next = recordContextDelivery(current, {
+        sessionId,
+        mode,
+        digest: envelope.digest,
+        deliveredAt: now,
+      });
+      return next;
+    });
   }
   try {
     await journal.recordContext({
@@ -528,9 +866,39 @@ async function createContextEnvelope({
   return ombreWarning ? { ...envelope, warnings: [ombreWarning] } : envelope;
 }
 
+// 没填类型但给了 exchange（她的一句 + 他的一段）→ 服务端替接收端判互动类型和氛围。
+// MCP（官方客户端版）和 REST /v1/conversation-event（自建运行时）共用；8 分钟内不重复判，和 PaiHome 钩子的节流一致。
+// exchange 正文只走这一跳：判完即删，不进状态、不进审计。
+async function classifyExchange(event, source = 'api') {
+  if (event.interactionType === undefined && event.interaction_type !== undefined) event.interactionType = event.interaction_type;
+  // cause：她那句让他不痛快的话（≤60 字），只在冲突时有意义；接收端可以直接给，也可以由 exchange 里截出来
+  event.cause = String(event.cause ?? '').replace(/\s+/g, ' ').trim().slice(0, 60) || undefined;
+  const exchange = String(event.exchange ?? '').replace(/\s+/g, ' ').trim().slice(0, 1500);
+  delete event.exchange;
+  if (event.interactionType || !exchange || !config.model.enabled) return null;
+  const snapshot = await store.read();
+  const lastAt = Date.parse(snapshot.interactionClassifyAt ?? '');
+  if (Number.isFinite(lastAt) && Date.now() - lastAt < (config.interaction?.classifyMinMinutes ?? 8) * 60_000) return { skipped: 'throttled' };
+  try {
+    const tag = await model.classifyInteraction(exchange);
+    if (!tag) return null;
+    event.interactionType = tag.type;
+    event.sessionState = { ...(event.sessionState ?? event.session_state ?? {}), tone: tag.tone, warmth: tag.warmth, tension: tag.tension };
+    if (tag.type === 'conflict' && !event.cause) {
+      const her = exchange.match(/她说：(.+?)(?:\s*他回：|$)/);
+      if (her) event.cause = her[1].trim().slice(0, 60);
+    }
+    await updateState({ type: 'interaction_classified', source, details: { type: tag.type, tone: tag.tone }, at: new Date() },
+      (current) => ({ ...current, interactionClassifyAt: new Date().toISOString() }));
+    log('interaction_classified', { type: tag.type, tone: tag.tone, source });
+    return { type: tag.type, tone: tag.tone };
+  } catch (error) { log('interaction_classify_failed', { message: error.message }); return null; }
+}
+
 async function recordConversationEvent(event, source = 'api', now = new Date()) {
   let applied;
   const auditDetails = {};
+  const driveBias = await personality.getDriveBias(now);
   const state = await updateState({
     type: source === 'heartbeat' ? 'conversation_heartbeat' : 'conversation_event',
     source: source === 'mcp' ? 'mcp' : 'api',
@@ -541,8 +909,11 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
   }, (current) => {
     applied = settleAndApplyConversationEvent(current, event, now, {
       sleepAfterMinutes: config.sleepAfterMinutes,
-      settle: config.settle,
+      settle: { ...config.settle, driveBias },
       interaction: config.interaction,
+      // 作息预期只从她真实的到来学习，心跳不算。
+      recordArrival: config.anticipation.enabled && source !== 'heartbeat',
+      arrivalGapMinutes: config.anticipation.arrivalGapMinutes,
     });
     Object.assign(auditDetails, {
       changed: applied.changed,
@@ -563,6 +934,84 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
     interaction: applied.interaction,
     settledHours: Number(applied.settled.elapsedHours.toFixed(4)),
   };
+}
+
+// 黑匣子：put / list / read / burn / keep。唯一入口，没有 HTTP 路由。
+async function handleBox(input = {}, now = new Date()) {
+  const action = String(input.action ?? '').trim().toLowerCase();
+  if (action === 'put') {
+    const item = await blackBox.put({ text: input.text, kind: input.kind, title: input.title, expiresHours: input.expiresHours, surface: input.surface, when: input.when, remindAt: input.remindAt }, now);
+    log('box_put', { id: item.id, kind: item.kind });
+    return { text: `放进匣子了：[${item.id}] ${item.kind}${item.when ? `，事在 ${item.when.slice(0, 10)}` : ''}${item.remindAt ? `，${item.remindAt.slice(5, 16).replace('T', ' ')} 提醒` : ''}${item.expiresAt ? `，${item.expiresAt.slice(0, 10)} 到期` : ''}`, data: { id: item.id, kind: item.kind, createdAt: item.createdAt, expiresAt: item.expiresAt } };
+  }
+  if (action === 'list') {
+    const items = await blackBox.list(now);
+    return { text: `匣子里有 ${items.length} 条。\n${renderBoxList(items)}`, data: { count: items.length, ids: items.map((x) => x.id) } };
+  }
+  if (action === 'read') {
+    const item = await blackBox.read(input.id, now);
+    if (!item) return { text: `匣子里没有这条：${input.id ?? ''}`, data: { found: false } };
+    return { text: `[${item.id}] ${item.kind}${item.title ? ` · ${item.title}` : ''}（${item.createdAt.slice(0, 16).replace('T', ' ')}）\n${item.text}`, data: { found: true, id: item.id } };
+  }
+  if (action === 'burn') {
+    const ok = await blackBox.burn(input.id, now);
+    if (ok) log('box_burn', { id: input.id });
+    return { text: ok ? `烧了：${input.id}` : `匣子里没有这条：${input.id ?? ''}`, data: { burned: ok } };
+  }
+  if (action === 'keep') {
+    const item = await blackBox.read(input.id, now);
+    if (!item) return { text: `匣子里没有这条：${input.id ?? ''}`, data: { found: false } };
+    if (!config.ombre.writeEnabled || config.shadowMode) return { text: 'OB 写入没开，搬不出去。', data: { kept: false } };
+    const bucketId = await ombre.storeHeldOutput({ content: item.text });
+    await blackBox.markKept(item.id, bucketId, now);
+    log('box_keep', { id: item.id, bucketId });
+    return { text: `搬进 OB 了：${item.id} → ${bucketId}。匣子里那条还在，想烧就烧。`, data: { kept: true, bucketId } };
+  }
+  throw new Error('action 必须是 put / list / read / burn / keep');
+}
+
+// 自我觉察工具：list / confirm / dismiss / scan。确认时若 OB 写开关打开，经 I 沉淀为候选自我认知。
+async function handleAwareness(input = {}, now = new Date()) {
+  const action = String(input.action ?? 'list').trim().toLowerCase();
+  if (action === 'list') return { action, ...awarenessSummary(await store.read()) };
+  if (action === 'scan') {
+    const state = await updateState({ type: 'awareness_scan', source: 'mcp', at: now },
+      (latest) => scanAwareness(latest, now, { timeZone: config.settle.timeZone, force: true }).state);
+    return { action, ...awarenessSummary(state) };
+  }
+  if (action !== 'confirm' && action !== 'dismiss') throw new Error('action 必须是 list / confirm / dismiss / scan');
+  const id = String(input.id ?? '').trim();
+  if (!id) throw new Error('confirm / dismiss 需要 id');
+  const current = await store.read();
+  const probe = resolveAwareness(current, id, action === 'confirm' ? 'confirmed' : 'dismissed', {}, now);
+  if (!probe.found) return { action, found: false, id };
+  if (probe.already) return { action, found: true, already: probe.already, id };
+  // 注意：这里不能叫 ombre——文件顶部的 OB 客户端就叫 ombre，之前被局部变量遮住，确认从来没写进过 OB（2026-09-05 → 09-09）
+  // 3.3.3：只有他自己写的那句才进 OB；不带 text 的确认只在心潮记一笔（候选模板原文永远不进 OB）
+  let ombreResult = null;
+  const ownWords = String(input.text ?? '').trim();
+  if (action === 'confirm' && ownWords && config.ombre.writeEnabled && !config.shadowMode) {
+    const aspect = String(input.aspect ?? probe.item.aspect ?? 'patterns');
+    ombreResult = await writeAwarenessToOmbre(id, ownWords, aspect);
+  }
+  const state = await updateState({
+    type: action === 'confirm' ? 'awareness_confirm' : 'awareness_dismiss',
+    source: 'mcp',
+    details: { id, kind: probe.item.kind, ombre: ombreResult ? ombreResult.ok : null },
+    at: now,
+  }, (latest) => resolveAwareness(latest, id, action === 'confirm' ? 'confirmed' : 'dismissed', { text: input.text, note: input.note, aspect: input.aspect, ombre: ombreResult }, now).state);
+  const item = state.awareness.candidates.find((c) => c.id === id);
+  return { action, found: true, id, item, ombre: ombreResult };
+}
+
+async function writeAwarenessToOmbre(id, content, aspect) {
+  try {
+    const reply = await ombre.writeSelfAwareness(content, aspect);
+    return { ok: true, aspect, reply: String(reply ?? '').slice(0, 200) };
+  } catch (error) {
+    log('awareness_ombre_write_failed', { id, message: error.message });
+    return { ok: false, aspect, error: String(error.message ?? error).slice(0, 200) };
+  }
 }
 
 async function saveHandoffNote(note, source = 'mcp', now = new Date()) {
@@ -620,25 +1069,39 @@ async function enqueueDashboardInteraction(event, result) {
   return { queued: true, deliveryId: queued.delivery.id, duplicate: queued.duplicate };
 }
 
-function bridgeDeliveryFromDashboard(payload = {}, now = new Date()) {
-  const allowed = new Set(['event_id', 'eventId', 'message', 'deliver_after', 'deliverAfter']);
-  const unexpected = Object.keys(payload).filter((key) => !allowed.has(key));
-  if (unexpected.length) throw new Error('bridge delivery only accepts event_id, message and deliver_after');
-  const eventId = String(payload.event_id ?? payload.eventId ?? '').trim();
-  const message = String(payload.message ?? '').replace(/\s+/g, ' ').trim();
-  const deliverAfter = payload.deliver_after ?? payload.deliverAfter ?? null;
-  if (eventId.length < 8 || eventId.length > 120) throw new Error('event_id must contain 8 to 120 characters');
-  if (!message || message.length > 1200) throw new Error('message must contain 1 to 1200 characters');
-  const scheduled = deliverAfter && Date.parse(deliverAfter) > now.getTime();
-  return { eventId, message, deliverAfter, reason: scheduled ? 'scheduled_interaction' : 'user_note' };
-}
-
 function handoffNoteFromHttp(payload = {}) {
   return {
     sessionId: payload.sessionId ?? payload.session_id,
     eventId: payload.eventId ?? payload.event_id,
     note: payload.note,
     ttlHours: payload.ttlHours ?? payload.ttl_hours,
+  };
+}
+
+async function enqueueCabinNotice({ eventId, message }) {
+  if (!config.bridge.enabled) return null;
+  const queued = await bridgeQueue.enqueue({ eventId, reason: 'user_note', message });
+  await publishReadyBridgeDeliveries();
+  return { queued: true, duplicate: queued.duplicate, deliveryId: queued.delivery.id };
+}
+
+function cabinNoteInput(payload = {}, defaultFrom = 'user') {
+  return {
+    eventId: payload.event_id ?? payload.eventId,
+    from: payload.from ?? defaultFrom,
+    content: payload.content,
+    timestamp: payload.timestamp,
+    locked: payload.locked,
+  };
+}
+
+function cabinLedgerInput(payload = {}) {
+  return {
+    eventId: payload.event_id ?? payload.eventId,
+    type: payload.type,
+    item: payload.item,
+    amount: payload.amount,
+    date: payload.date,
   };
 }
 
@@ -713,9 +1176,8 @@ const server = createServer(async (request, response) => {
         return send(response, 401, { error: 'invalid credentials' });
       }
       const session = dashboardAuth.createSession();
-      // 浏览器直连拿不到 HttpOnly Cookie，只能把 token 交到 JS 手里。
-      // 这是实打实的降级，所以必须由调用方显式要求，不能因为「顺手也返回」
-      // 而让同源前端意外持有 token —— 同源那条路的价值就是浏览器从不碰它。
+      // 跨源直连必须由调用方显式选择 header 模式；同源模式仍只下发
+      // HttpOnly Cookie，避免普通 Dashboard 前端接触会话 token。
       const headerMode = String(payload.mode ?? '').toLowerCase() === 'header';
       log('dashboard_session_created', { sessionExpiresAt: session.expiresAt, headerMode });
       const responseBody = {
@@ -744,6 +1206,11 @@ const server = createServer(async (request, response) => {
           return send(response, 400, { error: error.message });
         }
       }
+      if (url.pathname === '/dashboard/api/pending') {
+        // 3.3：退役。GET 回说明，PATCH 回 410，网页那页可以下线。
+        if (request.method === 'GET') return send(response, 200, await dashboardPayload(url.pathname, url));
+        return send(response, 410, { error: 'pending_from_me 已退役，黑匣子接替；人类看不到匣子里的内容。' });
+      }
       if (url.pathname === '/dashboard/api/bridge/deliveries') {
         if (!config.bridge.enabled) return send(response, 503, { error: 'bridge disabled' });
         if (request.method === 'GET') {
@@ -766,6 +1233,84 @@ const server = createServer(async (request, response) => {
           }
         }
         return send(response, 405, { error: 'method not allowed' }, { Allow: 'GET, POST' });
+      }
+      if (url.pathname === '/dashboard/api/cabin/note') {
+        if (request.method === 'POST') {
+          try {
+            const result = await cabin.addNote(cabinNoteInput(await body(request)));
+            let bridge = null;
+            if (result.note.from === 'user' && !result.duplicate) {
+              bridge = await enqueueCabinNotice({
+                eventId: result.note.eventId,
+                message: result.note.locked
+                  ? `${config.identity.notificationRecipient}在小屋里留了一封上锁的信。你可以知道它存在，但在对方主动开锁前不能读取正文。`
+                  : `${config.identity.notificationRecipient}在小屋里留了一封已经允许你阅读的信。请通过“小屋收件箱”读取。`,
+              });
+            }
+            return send(response, result.duplicate ? 200 : 201, { ...result, bridge });
+          } catch (error) {
+            return send(response, 400, { error: error.message });
+          }
+        }
+        if (request.method === 'PATCH') {
+          try {
+            const payload = await body(request);
+            if (payload.read === true || payload.read_all === true) {
+              return send(response, 200, await cabin.markAiNotesRead(payload.ids));
+            }
+            if (typeof payload.locked === 'boolean') {
+              const note = await cabin.setNoteLock(payload.id, payload.locked);
+              if (!note) return send(response, 404, { error: 'note not found' });
+              let bridge = null;
+              if (!note.locked) {
+                bridge = await enqueueCabinNotice({
+                  eventId: `unlock:${note.eventId}`,
+                  message: `${config.identity.notificationRecipient}刚刚打开了小屋里那封信的锁，现在允许你通过“小屋收件箱”读取正文。`,
+                });
+              }
+              return send(response, 200, { note, bridge });
+            }
+            return send(response, 400, { error: 'unsupported note update' });
+          } catch (error) {
+            return send(response, 400, { error: error.message });
+          }
+        }
+        return send(response, 405, { error: 'method not allowed' }, { Allow: 'POST, PATCH' });
+      }
+      if (url.pathname === '/dashboard/api/cabin/ledger') {
+        try {
+          if (request.method === 'POST') {
+            const result = await cabin.addLedger(cabinLedgerInput(await body(request)));
+            const bridge = result.duplicate ? null : await enqueueCabinNotice({
+              eventId: result.entry.eventId,
+              message: `${config.identity.notificationRecipient}在恋爱账本里记下了一笔${result.entry.type === 'expense' ? '支出' : '收入'}：${result.entry.item}，金额 ${result.entry.amount.toFixed(2)}。`,
+            });
+            return send(response, result.duplicate ? 200 : 201, { ...result, bridge });
+          }
+          if (request.method === 'PATCH') {
+            const payload = await body(request);
+            const entry = await cabin.updateLedger(payload.id, payload);
+            if (!entry) return send(response, 404, { error: 'ledger entry not found' });
+            const bridge = await enqueueCabinNotice({
+              eventId: `ledger-edit:${entry.id}:${Date.now()}`,
+              message: `${config.identity.notificationRecipient}更新了恋爱账本中的“${entry.item}”。`,
+            });
+            return send(response, 200, { entry, bridge });
+          }
+          if (request.method === 'DELETE') {
+            const payload = await body(request);
+            const entry = await cabin.deleteLedger(payload.id);
+            if (!entry) return send(response, 404, { error: 'ledger entry not found' });
+            const bridge = await enqueueCabinNotice({
+              eventId: `ledger-delete:${entry.id}:${Date.now()}`,
+              message: `${config.identity.notificationRecipient}从恋爱账本里删除了“${entry.item}”。`,
+            });
+            return send(response, 200, { deleted: true, entry, bridge });
+          }
+        } catch (error) {
+          return send(response, 400, { error: error.message });
+        }
+        return send(response, 405, { error: 'method not allowed' }, { Allow: 'POST, PATCH, DELETE' });
       }
       if (request.method !== 'GET') return send(response, 405, { error: 'method not allowed' }, { Allow: 'GET' });
       const payload = await dashboardPayload(url.pathname, url);
@@ -795,7 +1340,19 @@ const server = createServer(async (request, response) => {
           return createContextEnvelope(args);
         },
         event: async (event) => {
+          // 硬门：他自己在窗口里直接填的类型，只认"自己动一下就能落"的四种；关系类要有她的话（exchange）为证
+          const declared = String(event.interactionType ?? event.interaction_type ?? '').trim().toLowerCase();
+          let gated = null;
+          if (config.interaction.mcpSelfReportGate && declared && !SELF_REPORT_TYPES.has(declared) && !String(event.exchange ?? '').trim()) {
+            gated = declared;
+            event.interactionType = ''; delete event.interaction_type;
+          }
+          await classifyExchange(event, 'mcp');
           const result = await recordConversationEvent(event, 'mcp');
+          if (gated) {
+            result.interaction = { type: gated, applied: false, reasonCode: 'needs_her', affectedDrives: [] };
+            log('interaction_self_report_gated', { type: gated });
+          }
           return {
             revision: result.revision,
             consciousness: result.consciousness,
@@ -807,6 +1364,40 @@ const server = createServer(async (request, response) => {
           };
         },
         handoffNote: async (note) => saveHandoffNote(note, 'mcp'),
+        awareness: async (input) => handleAwareness(input),
+        box: async (input) => handleBox(input),
+        toolsHide: config.toolsHide,
+        // 每个 xinchao_* 工具回应末尾的"此刻"一行（官方客户端没有钩子，靠这个拿状态）
+        nowLine: async () => {
+          const state = await store.read();
+          let boxCount = 0; try { boxCount = await blackBox.count(new Date()); } catch { boxCount = 0; }
+          const line = renderNowLine(state, new Date());
+          return boxCount > 0 ? `${line}；匣子里 ${boxCount} 条` : line;
+        },
+        personalityReflect: async (input) => personality.recordAiAssessment(input),
+        personalityStats: async () => {
+          const core = await personality.getPersonalityCore();
+          return { stats: computePersonalityStats(core), core };
+        },
+        personalityAnchorUpdate: async (input) => personality.updateAnchors(input),
+        cabinInbox: async () => cabin.unlockedUserNotes(),
+        cabinNote: async (note) => cabin.addNote({ ...note, from: 'ai', locked: false }),
+        // 公共留言板：只有配了令牌才把 board_post / board_read 工具暴露出来 / 接受调用。
+        boardEnabled: boardEnabled(config),
+        boardPost: async ({ content }) => postBoardMessage(config, content),
+        boardRead: async ({ limit, query }) => readBoardMessages(config, { limit, query }),
+        // 心潮念网关：把 OB 记忆工具经心潮同一端点暴露/转发。
+        listObTools: async () => {
+          if (!config.ombre.readEnabled) return [];
+          return ombre.listTools();
+        },
+        // 情绪 → 记忆：他经网关调 breath/hold 没自己给坐标时，替他带上此刻情绪（grow 不碰）。
+        callOb: async (name, args) => {
+          if (!config.ombre.emotionStamp) return ombre.call(name, args);
+          const stamped = stampEmotionArgs(name, args, await store.read());
+          if (stamped.stamped) log('ombre_emotion_stamped', { tool: String(name).slice(0, 40), ...stamped.coords });
+          return ombre.call(name, stamped.args);
+        },
       });
       if (payload?.method === 'initialize' || payload?.method === 'tools/call') {
         log('mcp_request', {
@@ -838,6 +1429,13 @@ const server = createServer(async (request, response) => {
         generatedAt: new Date().toISOString(),
       });
     }
+    // 钩子用的"此刻"压缩块：只读状态，不记投递、不动 pending。星港 UserPromptSubmit 每条消息拉一次。
+    if (request.method === 'GET' && url.pathname === '/v1/now') {
+      const state = await store.read();
+      let boxCount = 0; let boxSurfaced = 0;
+      try { boxCount = await blackBox.count(new Date()); boxSurfaced = (await blackBox.surfaced(new Date())).length; } catch { boxCount = 0; }
+      return send(response, 200, buildNowCompact(state, new Date(), { timeZone: config.settle.timeZone, boxCount, boxSurfaced, awarenessReviewWeekday: config.awareness.reviewWeekday }));
+    }
     if (request.method === 'GET' && url.pathname === '/v1/context') {
       if (!config.context.enabled) return send(response, 503, { error: 'context envelope disabled' });
       const now = new Date();
@@ -866,7 +1464,9 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && (url.pathname === '/v1/conversation-event' || url.pathname === '/v1/heartbeat')) {
       const event = await body(request);
       const source = url.pathname === '/v1/heartbeat' ? 'heartbeat' : 'api';
-      return send(response, 200, await recordConversationEvent(event, source));
+      const classified = source === 'heartbeat' ? null : await classifyExchange(event, 'api');
+      const result = await recordConversationEvent(event, source);
+      return send(response, 200, classified?.type ? { ...result, classified } : result);
     }
     if (request.method === 'POST' && url.pathname === '/v1/handoff-note') {
       const payload = await body(request);
@@ -892,6 +1492,20 @@ const server = createServer(async (request, response) => {
 
 server.listen(config.port, '0.0.0.0', async () => {
   await store.read();
+  await cabin.init();
+  await blackBox.init();
+  // 3.3 升级迁移：攒下的话（pending_from_me）退役，还没说出口、也没被放下的条目搬进黑匣子当备忘，然后从状态里拿掉。
+  try {
+    const snapshot = await store.read();
+    const leftovers = (Array.isArray(snapshot.pending) ? snapshot.pending : []).filter((item) => item?.status !== 'consumed' && item?.disposition !== 'dropped' && String(item?.content ?? '').trim());
+    for (const item of leftovers) {
+      await blackBox.put({ text: String(item.content).trim(), kind: 'memo', title: `从攒下的话迁来 · ${item.kind ?? ''}`.trim(), surface: true });
+    }
+    if (Array.isArray(snapshot.pending)) {
+      await updateState({ type: 'pending_retired', source: 'migration', details: { migrated: leftovers.length }, at: new Date() }, (current) => { delete current.pending; return current; });
+      log('pending_retired', { migrated: leftovers.length });
+    }
+  } catch (error) { log('pending_migration_failed', { message: error.message }); }
   if (config.bridge.enabled) await bridgeQueue.init();
   log('service_started', { port: config.port, shadow: config.shadowMode, modelEnabled: config.model.enabled, barkEnabled: config.bark.enabled, bridgeEnabled: config.bridge.enabled });
 });
