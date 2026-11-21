@@ -68,6 +68,7 @@ export function loadConfig() {
     mcp: {
       enabled: bool('MCP_ENABLED', false),
       pathToken: process.env.MCP_PATH_TOKEN ?? '',
+      heartbeatMs: number('MCP_HEARTBEAT_MS', 20000, 100, 120000),
     },
     oauth: {
       enabled: bool('OAUTH_ENABLED', false),

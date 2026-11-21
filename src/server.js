@@ -1324,6 +1324,28 @@ const server = createServer(async (request, response) => {
         if (oauth.enabled) response.setHeader('WWW-Authenticate', oauth.wwwAuthenticate());
         return sendMcp(response, 401, { error: 'unauthorized' });
       }
+      if (request.method === 'GET') {
+        const sessionId = transportSessionId(request);
+        response.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-store, no-transform',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+          'Mcp-Session-Id': sessionId,
+          'MCP-Protocol-Version': negotiatedProtocolVersion(request),
+        });
+        response.write(': connected\n\n');
+        const heartbeat = setInterval(() => {
+          if (!response.writableEnded && !response.destroyed) {
+            response.write(': ping\n\n');
+          }
+        }, config.mcp.heartbeatMs);
+        heartbeat.unref();
+        const cleanup = () => clearInterval(heartbeat);
+        request.on('close', cleanup);
+        response.on('close', cleanup);
+        return;
+      }
       if (request.method === 'DELETE') {
         return sendMcp(response, 204, null, {
           'Mcp-Session-Id': transportSessionId(request),
@@ -1331,7 +1353,7 @@ const server = createServer(async (request, response) => {
         });
       }
       if (request.method !== 'POST') {
-        response.setHeader('Allow', 'POST, DELETE');
+        response.setHeader('Allow', 'GET, POST, DELETE');
         return sendMcp(response, 405, { error: 'method not allowed' });
       }
       const payload = await body(request);
@@ -1492,6 +1514,9 @@ const server = createServer(async (request, response) => {
     return send(response, 400, { error: error.message });
   }
 });
+
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
 
 server.listen(config.port, '0.0.0.0', async () => {
   await store.read();
