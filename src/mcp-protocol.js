@@ -728,7 +728,7 @@ export async function handleMcpMessage(payload, handlers) {
   if (payload.jsonrpc !== '2.0' || typeof method !== 'string') {
     return { status: 400, body: errorResponse(id, -32600, 'Invalid Request') };
   }
-  if (method === 'notifications/initialized' || method === 'notifications/cancelled') {
+  if (method.startsWith('notifications/')) {
     return { status: 202, body: null };
   }
   if (method === 'initialize') {
@@ -784,5 +784,8 @@ export async function handleMcpMessage(payload, handlers) {
       return { status: 200, body: response(id, toolError(error.message)) };
     }
   }
-  return { status: 404, body: errorResponse(id, -32601, 'Method not found') };
+  if (payload.id === undefined) {
+    return { status: 202, body: null };
+  }
+  return { status: 200, body: errorResponse(id, -32601, 'Method not found') };
 }
